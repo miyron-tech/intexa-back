@@ -1,0 +1,98 @@
+import 'reflect-metadata';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+import {mkdtemp,readFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import pg from 'pg';
+import {DataSource} from 'typeorm';
+import {ConfigService} from '@nestjs/config';
+import {HttpException} from '@nestjs/common';
+import {buildDataSourceOptions} from '../dist/database/data-source.js';
+import {GenerationJob} from '../dist/generation/entities/generation-job.entity.js';
+import {BillingService} from '../dist/generation/billing.service.js';
+import {StorageService} from '../dist/generation/storage.service.js';
+import {VideoContinuationService} from '../dist/generation/video-continuation.service.js';
+import {GenerationController} from '../dist/generation/generation.controller.js';
+import {JobRunnerService} from '../dist/generation/job-runner.service.js';
+const schema='continuation_'+randomUUID().replaceAll('-',''),folder=await mkdtemp(join(tmpdir(),'continuation-test-'));
+const control=new pg.Client({connectionString:process.env.DATABASE_URL});await control.connect();await control.query(`CREATE SCHEMA "${schema}"`);
+const url=new URL(process.env.DATABASE_URL);url.searchParams.set('options',`-c search_path=${schema}`);
+const db=new DataSource({...buildDataSourceOptions(url.toString()),schema});
+const timer=globalThis.setTimeout;
+try {
+ await db.initialize();await db.runMigrations();
+ const exec=promisify(execFile);
+ await exec('ffmpeg',['-v','error','-f','lavfi','-i','color=c=blue:s=320x240:r=25','-f','lavfi','-i','sine=frequency=440:sample_rate=44100','-t','2','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac',join(folder,'source.mp4')]);
+ await exec('ffmpeg',['-v','error','-f','lavfi','-i','color=c=red:s=240x320:r=24','-t','4','-c:v','libx264','-pix_fmt','yuv420p',join(folder,'segment.mp4')]);
+ const [user]=await db.query("INSERT INTO users(email,password_hash,credit_balance,credit_value_usd) VALUES('continue@example.invalid','not-a-login',1000,20) RETURNING id");
+ const config=new ConfigService({STORAGE_DIR:folder}),storage=new StorageService(config),billing=new BillingService(db),repo=db.getRepository(GenerationJob),media=new VideoContinuationService();
+ const sourcePath=await storage.save(user.id,randomUUID(),'source.mp4',await readFile(join(folder,'source.mp4')));
+ const source=await repo.save(repo.create({userId:user.id,service:'video_ad',preset:'custom',status:'succeeded',params:{},outputs:[{path:sourcePath,mimeType:'video/mp4',bytes:1}]}));
+ const controller=new GenerationController(repo,{enqueue(){}},storage,{},billing,media);
+ const dto={requestId:randomUUID(),description:'Continue the scene',videoModel:'premium',duration:4,expectedCredits:100};
+ await assert.rejects(controller.extend({sub:randomUUID()},source.id,dto),/not found/);
+ await assert.rejects(controller.extend({sub:user.id},source.id,{...dto,expectedCredits:1}),/price/);
+ await assert.rejects(controller.extend({sub:user.id},source.id,{...dto,duration:61}),/between 2 and 60/);
+ const duplicates=await Promise.all([controller.extend({sub:user.id},source.id,dto),controller.extend({sub:user.id},source.id,dto)]);
+ assert.equal(duplicates[0].id,duplicates[1].id);
+ assert.equal((await db.query('SELECT credit_balance FROM users WHERE id=$1',[user.id]))[0].credit_balance,900);
+ await assert.rejects(controller.extend({sub:user.id},source.id,{...dto,description:'Different request'}),/already used/);
+ let created=0,fail=false;
+ const client={createVideo:async(body)=>{created++;assert.equal(body.model,'google/veo-3.1-fast');assert(body.frame_images[0].image_url.url.startsWith('data:image/jpeg;base64,'));assert(body.prompt.includes('Continue naturally'));if(fail)throw Error('provider failure');return 'mock-video';},getVideo:async()=>({status:'completed',urls:['mock://video'],usage:{cost:0.5}}),downloadVideo:async()=>({buffer:await readFile(join(folder,'segment.mp4')),mimeType:'video/mp4'})};
+ const runner=new JobRunnerService(repo,client,storage,{},config,billing,undefined,media);
+ globalThis.setTimeout=(fn,ms,...args)=>timer(fn,ms===10000?0:ms,...args);
+ await runner.run(duplicates[0].id);
+ const result=await repo.findOneByOrFail({id:duplicates[0].id});assert.equal(result.status,'succeeded');assert.equal(result.creditsCharged,100);assert.equal(created,1);
+ const info=await media.inspect(storage.absolute(result.outputs[0].path));assert(Math.abs(info.duration-6)<0.2);assert.equal(info.width,320);assert.equal(info.height,240);assert(info.audio);
+ assert((await readFile(storage.absolute(sourcePath))).length>0);
+ await runner.run(result.id);assert.equal(created,1);
+ fail=true;const second=await controller.extend({sub:user.id},source.id,{...dto,requestId:randomUUID()});await runner.run(second.id);
+ const failed=await repo.findOneByOrFail({id:second.id});assert.equal(failed.billingStatus,'refunded');assert.equal((await db.query('SELECT credit_balance FROM users WHERE id=$1',[user.id]))[0].credit_balance,900);
+ const blocked=await repo.save(repo.create({userId:user.id,service:'video_ad',preset:'custom',status:'failed',params:{},outputs:[]}));await assert.rejects(controller.extend({sub:user.id},blocked.id,{...dto,requestId:randomUUID()}),/completed video/);
+ const longMedia={inspect:async()=>({duration:119,width:320,height:240})};const capped=new GenerationController(repo,{enqueue(){}},storage,{},billing,longMedia);await assert.rejects(capped.extend({sub:user.id},source.id,{...dto,requestId:randomUUID()}),/120 seconds/);
+ // Generate a complete 30-second video in one job, using real media assembly.
+ const [longUser]=await db.query("INSERT INTO users(email,password_hash,credit_balance,credit_value_usd) VALUES('long@example.invalid','not-a-login',2000,40) RETURNING id");
+ for(const seconds of [4,6,8])await exec('ffmpeg',['-v','error','-f','lavfi','-i','color=c=green:s=320x240:r=24','-t',String(seconds),'-c:v','libx264','-pix_fmt','yuv420p',join(folder,`clip-${seconds}.mp4`)]);
+ let calls=[],failAt=0,planCalls=0;
+ const longClient={
+  complete:async(model,system,input,report)=>{await report({cost:0.01},'plan');if(++planCalls===1)return '';return JSON.stringify(['Scene one','Scene two','Scene three','Scene four']);},
+  createVideo:async(body)=>{calls.push(body);if(calls.length===failAt)throw Error('scene failed');return String(body.duration);},
+  getVideo:async(id)=>({status:'completed',urls:[id],usage:{cost:0.1}}),
+  downloadVideo:async(id)=>({buffer:await readFile(join(folder,`clip-${id}.mp4`)),mimeType:'video/mp4'}),
+ };
+ const longRunner=new JobRunnerService(repo,longClient,storage,{},new ConfigService({OPENROUTER_TEXT_MODEL:'test-planner'}),billing,undefined,media);
+ const longDto={service:'video_ad',preset:'custom',requestId:randomUUID(),description:'One continuous story',videoModel:'premium',duration:30,expectedCredits:750};
+ const longJob=await controller.create({sub:longUser.id},longDto);await longRunner.run(longJob.id);
+ assert.equal(planCalls,2);const assembled=await repo.findOneByOrFail({id:longJob.id});assert.equal(assembled.status,'succeeded');assert.equal(assembled.params.duration,30);assert.equal(assembled.params.completedSegments,4);assert.deepEqual(calls.map(c=>c.duration),[8,8,8,6]);assert(!calls[0].frame_images);assert(calls.slice(1).every(c=>c.frame_images[0].image_url.url.startsWith('data:image/jpeg')));
+ const assembledInfo=await media.inspect(storage.absolute(assembled.outputs[0].path));assert(Math.abs(assembledInfo.duration-30)<0.25);assert.equal(assembled.creditsCharged,750);
+ calls=[];failAt=2;
+ const partial=await controller.create({sub:longUser.id},{...longDto,requestId:randomUUID()});await longRunner.run(partial.id);
+ const saved=await repo.findOneByOrFail({id:partial.id});assert.equal(saved.status,'failed');assert.equal(saved.billingStatus,'refunded');assert.equal(saved.outputs.length,1);assert.equal(saved.params.completedSegments,1);assert(Math.abs((await media.inspect(storage.absolute(saved.outputs[0].path))).duration-8)<0.1);assert.equal((await db.query('SELECT credit_balance FROM users WHERE id=$1',[longUser.id]))[0].credit_balance,1250);
+ await assert.rejects(controller.create({sub:longUser.id},{...longDto,requestId:randomUUID(),expectedCredits:100}),/price/);
+ calls=[];failAt=0;
+ const odd=await controller.create({sub:longUser.id},{...longDto,requestId:randomUUID(),duration:31,expectedCredits:800});await longRunner.run(odd.id);
+ const oddResult=await repo.findOneByOrFail({id:odd.id});assert.equal(oddResult.status,'succeeded');assert.deepEqual(calls.map(c=>c.duration),[8,8,8,8]);assert(Math.abs((await media.inspect(storage.absolute(oddResult.outputs[0].path))).duration-31)<0.1);assert.equal(oddResult.creditsCharged,800);
+ calls=[];
+ const short=await controller.create({sub:longUser.id},{...longDto,requestId:randomUUID(),duration:2,expectedCredits:100});await longRunner.run(short.id);
+ const shortResult=await repo.findOneByOrFail({id:short.id});assert.equal(shortResult.status,'succeeded');assert.equal(calls[0].duration,4);assert(Math.abs((await media.inspect(storage.absolute(shortResult.outputs[0].path))).duration-2)<0.1);assert.equal(shortResult.creditsCharged,100);
+ const [nativeUser]=await db.query("INSERT INTO users(email,password_hash,credit_balance,credit_value_usd) VALUES('native-wan@example.invalid','not-a-login',1000,20) RETURNING id");
+ await exec('ffmpeg',['-v','error','-f','lavfi','-i','color=c=yellow:s=320x240:r=24','-t','21','-c:v','libx264','-pix_fmt','yuv420p',join(folder,'native.mp4')]);
+ let nativeCalls=0,nativePolls=0;
+ const nativeClient={complete:async()=>{throw Error('A native 21-second video must not need a scene planner');},createVideo:async(body)=>{nativeCalls++;assert.equal(body.model,'alibaba/wan-3.0');assert.equal(body.duration,21);return 'native';},getVideo:async()=>{if(++nativePolls===1)throw new HttpException('temporary network failure',504);return {status:'completed',urls:['native'],usage:{cost:0.3}};},downloadVideo:async()=>({buffer:await readFile(join(folder,'native.mp4')),mimeType:'video/mp4'})};
+ const nativeRunner=new JobRunnerService(repo,nativeClient,storage,{},config,billing,undefined,media);
+ const native=await controller.create({sub:nativeUser.id},{...longDto,requestId:randomUUID(),videoModel:'draft',duration:21,expectedCredits:210});await nativeRunner.run(native.id);
+ const nativeResult=await repo.findOneByOrFail({id:native.id});assert.equal(nativeResult.status,'succeeded');assert.equal(nativeCalls,1);assert.equal(nativePolls,2);assert.equal(nativeResult.params.totalSegments,1);assert.equal(nativeResult.creditsCharged,210);
+ calls=[];failAt=0;const previousPlans=planCalls;
+ const resume=await controller.create({sub:nativeUser.id},{...longDto,requestId:randomUUID()});
+ const resumePath=await storage.save(nativeUser.id,resume.id,'checkpoint.mp4',await readFile(storage.absolute(saved.outputs[0].path)));
+ await repo.update(resume.id,{outputs:[{...saved.outputs[0],path:resumePath}],params:{...resume.params,completedSegments:1,plannedScenes:['Scene one','Scene two','Scene three','Scene four']}});
+ await longRunner.run(resume.id);const resumed=await repo.findOneByOrFail({id:resume.id});assert.equal(resumed.status,'succeeded');assert.deepEqual(calls.map(c=>c.duration),[8,8,6]);assert.equal(planCalls,previousPlans);assert(Math.abs((await media.inspect(storage.absolute(resumed.outputs[0].path))).duration-30)<0.25);
+ console.log('PASS: checkpoint recovery generates only remaining scenes, preserving the first clip and plan.');
+ console.log('PASS: Wan creates 21 seconds with exactly one video call, no scene planner and no concatenation.');
+ console.log('PASS: 31-second target bills 32 generated seconds and trims to 31; 2-second target bills 4 generated seconds and trims to 2.');
+ console.log('PASS: one job creates exact 30 seconds via 8+8+8+6, passes last frames, charges 750 once; mid-series error preserves completed video and refunds the full reservation.');
+ console.log('PASS: ownership, quote, duration, idempotent billing, real last-frame extraction, mixed-size/missing-audio concatenation, original preserved, provider failure refund, length cap. No paid calls.');
+} finally {globalThis.setTimeout=timer;await db.destroy();await control.query(`DROP SCHEMA "${schema}" CASCADE`);await control.end();await rm(folder,{recursive:true,force:true});}
