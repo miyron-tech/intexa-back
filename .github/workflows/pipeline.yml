@@ -1,0 +1,70 @@
+name: Checks and production
+on:
+  pull_request:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: intexa_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ci -d intexa_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://ci:ci-only-password@localhost:5432/intexa_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm install -g npm@11
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: npm ci
+      - run: npm run build
+      - name: Billing, payments, video, voice and deployment gate
+        run: |
+          node test/credits.integration.mjs
+          node test/payments.integration.mjs
+          node test/character-swap.integration.mjs
+          node test/video-continuation.integration.mjs
+          node test/voice-reference.integration.mjs
+          node test/deployment-gate.integration.mjs
+      - name: Deployment orchestration checks
+        run: |
+          bash -n .github/scripts/deploy-production.sh .github/scripts/deploy-from-ci.sh
+          python3 .github/scripts/test-deployment.py
+  deploy:
+    needs: checks
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+    concurrency:
+      group: intexa-production
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Deploy checked component
+        env:
+          DEPLOY_COMPONENT: backend
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: bash .github/scripts/deploy-from-ci.sh
