@@ -3,11 +3,13 @@ import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module.js';
+import { deploymentGate } from './deployment-gate.js';
 import type { Env } from './config/env.js';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
   const config = app.get(ConfigService<Env, true>);
+  app.use(deploymentGate(config.get('STORAGE_DIR', { infer: true })));
 
   // API вызывается сервером Next.js (BFF), который передаёт реальный IP клиента в X-Forwarded-For.
   // Доверяем заголовку только от loopback — в проде указать адрес/подсеть фронтенда.
