@@ -193,6 +193,8 @@ export class GenerationController {
           count: dto.count ?? 1,
           marketplace: dto.marketplace ?? null,
           aspectRatio: dto.aspectRatio ?? null,
+          outputWidth: dto.outputWidth ?? null,
+          outputHeight: dto.outputHeight ?? null,
           title: dto.title ?? null,
           badge: dto.badge ?? null,
           videoModel: dto.videoModel ?? null,

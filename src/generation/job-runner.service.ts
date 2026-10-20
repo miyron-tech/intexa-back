@@ -94,6 +94,8 @@ export class JobRunnerService implements OnApplicationBootstrap {
       if (job.service === 'character_swap') {
         if(!this.characterSwap) throw new Error('Character replacement is not connected');
         await this.characterSwap.run(job);
+      } else if (service!.kind === 'text') {
+        await this.runContent(job);
       } else if (service!.kind === 'video') {
         await this.runVideo(job, service!);
       } else {
@@ -110,6 +112,23 @@ export class JobRunnerService implements OnApplicationBootstrap {
     await this.billing.finish(job.id, false, job.outputs ?? [], error);
   }
 
+  private async runContent(job: GenerationJob): Promise<void> {
+    const description = String(job.params.description ?? '').trim();
+    if (!description) throw new Error('Describe your content first');
+    const model = this.config.get('OPENROUTER_TEXT_MODEL', { infer: true });
+    const system = 'You write useful TikTok copy based on the user\'s video or product description. ' +
+      'Reply in the same language as the user unless they request another. Give 3 distinct, concise caption options, ' +
+      'each with an opening hook, a natural call to action, and 3–5 relevant hashtags. ' +
+      'Use readable plain text with short section labels. Do not invent facts about the product, guaranteed reach, ' +
+      'trending tags or claims of having watched a video. Follow any requested tone or audience.';
+    await this.jobs.update(job.id, { prompt: description, model });
+    const report = await this.billing.startUsage(job.id, 'content', model, description);
+    const contentResult = await this.openRouter.complete(model, system, description, report, 2000);
+    if (!contentResult.trim()) throw new Error('The provider returned no content');
+    await this.jobs.update(job.id, { params: { ...job.params, contentResult } });
+    await this.billing.finish(job.id, true);
+  }
+
   // --- Изображения ---------------------------------------------------------
 
   private async runImages(
@@ -124,6 +143,8 @@ export class JobRunnerService implements OnApplicationBootstrap {
       aspectRatio?: string;
       title?: string;
       badge?: string;
+      outputWidth?: number;
+      outputHeight?: number;
     };
 
     const prompt = await this.buildPrompt(
@@ -152,6 +173,13 @@ export class JobRunnerService implements OnApplicationBootstrap {
       throw new Error('The provider did not return every requested variant');
 
     const spec = service.marketplaces?.find((m) => m.id === params.marketplace);
+    const ratioParts = params.aspectRatio?.split(':').map(Number);
+    const ratio = ratioParts && ratioParts[0] / ratioParts[1];
+    const target = params.outputWidth && params.outputHeight
+      ? { width: params.outputWidth, height: params.outputHeight }
+      : spec ?? (ratio && Number.isFinite(ratio) && ratio > 0
+        ? { width: ratio >= 1 ? 1024 : Math.round(1024 * ratio), height: ratio >= 1 ? Math.round(1024 / ratio) : 1024 }
+        : undefined);
     const outputs: GenerationJob['outputs'] = [];
     let index = 0;
 
@@ -160,11 +188,11 @@ export class JobRunnerService implements OnApplicationBootstrap {
         let buffer = image.buffer;
         let mimeType = image.mimeType;
 
-        if (spec) {
+        if (target) {
           const fitted = await this.images.fitTo(
             buffer,
-            spec.width,
-            spec.height,
+            target.width,
+            target.height,
           );
           buffer = fitted.buffer;
           mimeType = fitted.mimeType;

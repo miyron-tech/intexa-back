@@ -8,6 +8,7 @@ export const SERVICE_IDS = [
   'product_shot',
   'video_ad',
   'avatar',
+  'content_optimization',
 ] as const;
 
 export type ServiceId = (typeof SERVICE_IDS)[number];
@@ -44,7 +45,7 @@ export interface ServiceDefinition {
   id: ServiceId;
   title: string;
   description: string;
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'text';
   /** Сколько исходных изображений принимает услуга */
   inputImages: { min: number; max: number; label: string };
   presets: Preset[];
@@ -72,6 +73,12 @@ export const PRODUCT_GUARDRAILS =
   PHOTO_GUARDRAILS;
 
 export const SERVICES: ServiceDefinition[] = [
+  {
+    id: 'content_optimization', title: 'Content optimization',
+    description: 'Turn your video idea into a TikTok caption, hook and relevant hashtags.',
+    kind: 'text', inputImages: { min: 0, max: 0, label: '' }, maxOutputs: 1,
+    presets: [{ id: 'tiktok', title: 'TikTok description', description: 'A hook, caption and hashtags for your next post.', prompt: '' }],
+  },
   {
     id: 'marketplace_card',
     title: 'Marketplace listing card',
