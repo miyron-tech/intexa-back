@@ -5,6 +5,7 @@ import type { ServiceDefinition } from './services.catalog.js';
 
 export const PRICING_VERSION = 'credits-2026-09-v1';
 export const IMAGE_CREDITS = 10;
+export const CONTENT_CREDITS = 5;
 export const VIDEO_CREDITS: Record<string, number> = {
   draft: 10,
   standard: 20,
@@ -15,6 +16,15 @@ export function quoteCredits(
   service: ServiceDefinition,
   dto: CreateJobDto,
 ): number {
+  if (dto.outputWidth !== undefined || dto.outputHeight !== undefined) {
+    if (service.kind !== 'image' || ![dto.outputWidth, dto.outputHeight].every(n => Number.isInteger(n) && n! >= 256 && n! <= 2048))
+      throw new BadRequestException('Choose both image dimensions between 256 and 2048 pixels');
+  }
+  if (service.kind === 'text') {
+    if ((dto.count ?? 1) !== 1 || dto.aspectRatio || dto.videoModel || dto.duration || dto.marketplace)
+      throw new BadRequestException('Unsupported content settings');
+    return CONTENT_CREDITS;
+  }
   if (
     dto.aspectRatio &&
     !service.aspectRatios?.some((r) => r.id === dto.aspectRatio)
@@ -43,7 +53,7 @@ export function publicService(service: ServiceDefinition) {
   } = service;
   return {
     ...publicFields,
-    creditsPerImage: IMAGE_CREDITS,
+    creditsPerImage: service.kind === 'text' ? CONTENT_CREDITS : IMAGE_CREDITS,
     pricingVersion: PRICING_VERSION,
     presets: presets.map(({ prompt: _prompt, ...preset }) => preset),
     videoModels: videoModels?.map(

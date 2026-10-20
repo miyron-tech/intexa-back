@@ -58,6 +58,12 @@ export class CreateJobDto {
   @MaxLength(10)
   aspectRatio?: string;
 
+  @IsOptional() @Type(() => Number) @IsInt() @Min(256) @Max(2048)
+  outputWidth?: number;
+
+  @IsOptional() @Type(() => Number) @IsInt() @Min(256) @Max(2048)
+  outputHeight?: number;
+
   /** Заголовок для инфографики — накладывается нами поверх картинки */
   @IsOptional()
   @IsString()
