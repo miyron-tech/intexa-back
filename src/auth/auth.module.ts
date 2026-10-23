@@ -6,6 +6,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import type { Env } from '../config/env.js';
 import { UsersModule } from '../users/users.module.js';
 import { AuthController } from './auth.controller.js';
+import { PasswordResetService } from './password-reset.service.js';
 import { AuthService } from './auth.service.js';
 import { RefreshToken } from './entities/refresh-token.entity.js';
 import { JwtAuthGuard } from './guards/jwt-auth.guard.js';
@@ -26,6 +27,7 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard.js';
   controllers: [AuthController],
   providers: [
     AuthService,
+    PasswordResetService,
     // Все эндпоинты закрыты по умолчанию, открытые помечаются @Public()
     { provide: APP_GUARD, useClass: JwtAuthGuard },
   ],

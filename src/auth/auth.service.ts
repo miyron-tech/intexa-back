@@ -13,7 +13,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
 import argon2 from 'argon2';
-import { IsNull, Repository } from 'typeorm';
+import { DataSource, IsNull, Repository } from 'typeorm';
 import type { Env } from '../config/env.js';
 import type { User } from '../users/entities/user.entity.js';
 import { UsersService } from '../users/users.service.js';
@@ -37,6 +37,7 @@ export class AuthService {
 
   constructor(
     private readonly users: UsersService,
+    private readonly db: DataSource,
     private readonly jwt: JwtService,
     private readonly config: ConfigService<Env, true>,
     @InjectRepository(RefreshToken)
@@ -69,7 +70,7 @@ export class AuthService {
     }
     return {
       user: user as User,
-      tokens: await this.issueTokens(user.id, client),
+      tokens: await this.issueTokens(user.id, client, undefined, user.passwordHash),
     };
   }
 
@@ -93,7 +94,7 @@ export class AuthService {
         { revokedAt: new Date(), replacedById: nextSessionId },
       );
       if (affected) {
-        return this.issueTokens(session.userId, client, nextSessionId);
+        return this.issueTokens(session.userId, client, nextSessionId, undefined, session.id);
       }
       // Проиграли гонку — дальше решаем как для уже отозванного токена
       const current = await this.refreshTokens.findOneByOrFail({
@@ -109,7 +110,7 @@ export class AuthService {
       session.replacedById !== null &&
       Date.now() - session.revokedAt!.getTime() < REUSE_GRACE_MS;
     if (rotatedRecently) {
-      return this.issueTokens(session.userId, client);
+      return this.issueTokens(session.userId, client, undefined, undefined, session.id);
     }
 
     // Повторное использование давно отозванного токена — вероятная кража. Гасим все сессии.
@@ -135,23 +136,31 @@ export class AuthService {
     userId: string,
     client: ClientInfo,
     sessionId: string = randomUUID(),
+    expectedPasswordHash?: string,
+    sourceSessionId?: string,
   ): Promise<AuthTokens> {
     const accessTtl = this.config.get('JWT_ACCESS_TTL', { infer: true });
     const refreshTtl = this.config.get('JWT_REFRESH_TTL', { infer: true });
     const now = Date.now();
 
     const secret = randomBytes(32).toString('base64url');
-    const session = await this.refreshTokens.save(
-      this.refreshTokens.create({
-        id: sessionId,
-        userId,
-        tokenHash: this.hash(secret),
-        expiresAt: new Date(now + refreshTtl * 1000),
-        revokedAt: null,
-        replacedById: null,
-        userAgent: client.userAgent?.slice(0, 512) ?? null,
-      }),
-    );
+    const session = await this.db.transaction(async tx => {
+      // Share the account lock with password resets so an in-flight old login or
+      // refresh cannot create a session after the reset invalidates its credentials.
+      const [current] = await tx.query('SELECT password_hash,password_changed_at FROM users WHERE id=$1 FOR UPDATE', [userId]);
+      if (!current || (expectedPasswordHash && current.password_hash !== expectedPasswordHash))
+        throw new UnauthorizedException('Your session is invalid. Please sign in again');
+      if (sourceSessionId && current.password_changed_at) {
+        const [source] = await tx.query('SELECT r.id FROM refresh_tokens r JOIN users u ON u.id=r.user_id WHERE r.id=$1 AND r.user_id=$2 AND r.created_at >= u.password_changed_at', [sourceSessionId,userId]);
+        if (!source) throw new UnauthorizedException('Your session is invalid. Please sign in again');
+      }
+      const repo = tx.getRepository(RefreshToken);
+      return repo.save(repo.create({
+        id: sessionId, userId, tokenHash: this.hash(secret),
+        expiresAt: new Date(now + refreshTtl * 1000), revokedAt: null,
+        replacedById: null, userAgent: client.userAgent?.slice(0, 512) ?? null,
+      }));
+    });
 
     const payload: AccessTokenPayload = { sub: userId, sid: session.id };
     const accessToken = await this.jwt.signAsync(payload, {

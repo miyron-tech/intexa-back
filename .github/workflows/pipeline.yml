@@ -37,6 +37,7 @@ jobs:
       - run: npm run build
       - name: Billing, payments, video, voice and deployment gate
         run: |
+          node test/password-reset.integration.mjs
           node test/credits.integration.mjs
           node test/payments.integration.mjs
           node test/character-swap.integration.mjs

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,7 @@ import {
   orderEmail,
   type RenderedEmail,
   welcomeEmail,
+  passwordEmail,
 } from './templates.js';
 
 const POLL_MS = 10_000;
@@ -30,11 +32,11 @@ const TIME_ZONE = 'Europe/Vilnius';
 
 interface OutboxRow {
   id: string;
-  kind: 'welcome' | 'order_confirmation';
+  kind: 'welcome' | 'order_confirmation' | 'password_reset' | 'password_changed';
   user_id: string;
   top_up_id: string | null;
   attempts: number;
-  payload: { creditBalance?: number; balanceAfter?: number };
+  payload: { token?: string; creditBalance?: number; balanceAfter?: number };
 }
 
 const legalPdf = (name: string) =>
@@ -109,6 +111,14 @@ export class MailOutboxService
 
   private async deliver(row: OutboxRow): Promise<void> {
     try {
+      if (row.kind === 'password_reset') {
+        const digest = createHash('sha256').update(row.payload.token ?? '').digest('hex');
+        const [valid] = await this.db.query('SELECT 1 FROM password_resets WHERE token_hash=$1 AND user_id=$2 AND used_at IS NULL AND expires_at>now()', [digest,row.user_id]);
+        if (!valid) {
+          await this.db.query("UPDATE email_outbox SET status='failed',payload='{}',last_error='Reset link expired or used' WHERE id=$1", [row.id]);
+          return;
+        }
+      }
       const { to, email, attachments } = await this.compose(row);
       const info = await this.transport!.sendMail({
         from: this.config.get('MAIL_FROM', { infer: true }),
@@ -124,7 +134,7 @@ export class MailOutboxService
         await writeFile(join(this.fileDir, `${row.kind}-${row.id}.eml`), info.message as Buffer);
       }
       await this.db.query(
-        `UPDATE email_outbox SET status='sent', sent_at=now(), message_id=$2, last_error=NULL WHERE id=$1`,
+        `UPDATE email_outbox SET status='sent', sent_at=now(), message_id=$2, last_error=NULL, payload=CASE WHEN kind='password_reset' THEN '{}'::jsonb ELSE payload END WHERE id=$1`,
         [row.id, String(info.messageId ?? '').slice(0, 300)],
       );
     } catch (error) {
@@ -162,6 +172,14 @@ export class MailOutboxService
 
   private async compose(row: OutboxRow) {
     const site = this.config.get('FRONTEND_URL', { infer: true }).replace(/\/+$/, '');
+    if (row.kind === 'password_reset' || row.kind === 'password_changed') {
+      const [user] = await this.db.query('SELECT email FROM users WHERE id=$1', [row.user_id]);
+      if (row.kind === 'password_reset' && !row.payload.token) throw new Error('Reset link no longer available');
+      return { to: user.email as string, attachments: [], email: passwordEmail({
+        site, email: user.email,
+        resetUrl: row.kind === 'password_reset' ? `${site}/reset-password#token=${encodeURIComponent(row.payload.token!)}` : undefined,
+      }) };
+    }
     if (row.kind === 'welcome') {
       const [user] = await this.db.query('SELECT email FROM users WHERE id=$1', [row.user_id]);
       return {

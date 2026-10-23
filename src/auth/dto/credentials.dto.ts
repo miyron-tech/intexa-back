@@ -35,3 +35,12 @@ export class LoginDto {
   @MaxLength(128)
   password: string;
 }
+
+export class ForgotPasswordDto {
+  @Transform(normalizeEmail) @IsEmail() @MaxLength(320) email: string;
+}
+export class ResetPasswordDto {
+  @IsString() @Matches(/^[A-Za-z0-9_-]{43}$/) token: string;
+  @IsString() @MinLength(8) @MaxLength(128)
+  @Matches(/[A-Za-zА-Яа-яЁё]/) @Matches(/\d/) password: string;
+}

@@ -280,3 +280,22 @@ ${textFooter(d.site)}`;
     text,
   };
 }
+
+export function passwordEmail(d: { site: string; email: string; resetUrl?: string }): RenderedEmail {
+  const reset = Boolean(d.resetUrl);
+  const title = reset ? 'Reset your password.' : 'Password updated.';
+  const message = reset
+    ? `We received a request to reset the password for ${esc(d.email)}. Choose a new password using the button below. This link expires in 30 minutes and can only be used once.`
+    : `The password for ${esc(d.email)} has been changed. Your previous sessions have been signed out. You can now sign in with your new password.`;
+  const href = d.resetUrl ?? `${d.site}/login`;
+  const note = reset ? 'If you did not request this, you can ignore this email. Your password will stay unchanged.' : `If you did not make this change, reset your password immediately and contact ${company.email}.`;
+  return {
+    subject: reset ? 'Reset your intexa-ai.com password' : 'Your intexa-ai.com password was changed',
+    html: shell(title, `${topBar(esc(d.site), 'Account security')}<tr><td class="px" style="padding:44px 36px 36px;">
+      ${kicker('Your creative space')}<h1 class="h1" style="margin:0 0 22px;font-family:${F};font-size:48px;line-height:1.04;font-weight:500;letter-spacing:-2.6px;color:${C.ink};">${title}</h1>
+      ${p(message)}${button(esc(href), reset ? 'Choose a new password' : 'Sign in')}
+      <div style="height:28px"></div>${muted(note)}${muted(`If the button does not work, open this link:<br><a href="${esc(href)}" style="word-break:break-all;color:${C.muted};">${esc(href)}</a>`)}</td></tr>
+      ${footer(esc(d.site), 'A security notification for your intexa-ai.com account.')}`),
+    text: `${title}\n\n${message}\n\n${href}\n\n${note}\n\n${textFooter(d.site)}`,
+  };
+}
