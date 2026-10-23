@@ -4,6 +4,7 @@ import {
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 import { Reflector } from '@nestjs/core';
 import { JwtService } from '@nestjs/jwt';
 import type { Request } from 'express';
@@ -14,6 +15,7 @@ import { IS_PUBLIC_KEY } from '../decorators/public.decorator.js';
 export class JwtAuthGuard implements CanActivate {
   constructor(
     private readonly jwt: JwtService,
+    private readonly db: DataSource,
     private readonly reflector: Reflector,
   ) {}
 
@@ -34,6 +36,10 @@ export class JwtAuthGuard implements CanActivate {
 
     try {
       const payload = await this.jwt.verifyAsync<AccessTokenPayload>(token);
+      const [user] = await this.db.query(`SELECT u.id FROM users u WHERE u.id=$1 AND
+        (u.password_changed_at IS NULL OR EXISTS (SELECT 1 FROM refresh_tokens r
+         WHERE r.id=$2 AND r.user_id=u.id AND r.created_at>=u.password_changed_at))`, [payload.sub,payload.sid]);
+      if (!user) throw new UnauthorizedException();
       request.user = { sub: payload.sub, sid: payload.sid };
       return true;
     } catch {

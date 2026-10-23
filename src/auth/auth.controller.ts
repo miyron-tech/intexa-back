@@ -11,6 +11,8 @@ import {
 import { Throttle } from '@nestjs/throttler';
 import { toUserResponse } from '../users/user.response.js';
 import { UsersService } from '../users/users.service.js';
+import { PasswordResetService } from './password-reset.service.js';
+import { ForgotPasswordDto, ResetPasswordDto } from './dto/credentials.dto.js';
 import { AuthService } from './auth.service.js';
 import type { AccessTokenPayload } from './auth.types.js';
 import { CurrentUser } from './decorators/current-user.decorator.js';
@@ -25,8 +27,21 @@ const AUTH_THROTTLE = { default: { limit: 10, ttl: 60_000 } };
 export class AuthController {
   constructor(
     private readonly auth: AuthService,
+    private readonly passwordReset: PasswordResetService,
     private readonly users: UsersService,
   ) {}
+
+  @Public()
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  forgotPassword(@Body() dto: ForgotPasswordDto) { return this.passwordReset.request(dto.email); }
+
+  @Public()
+  @Throttle(AUTH_THROTTLE)
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  resetPassword(@Body() dto: ResetPasswordDto) { return this.passwordReset.reset(dto.token, dto.password); }
 
   @Public()
   @Throttle(AUTH_THROTTLE)
